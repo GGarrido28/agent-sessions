@@ -84,6 +84,25 @@ def decode(raw):
         return raw.decode("utf-8", "replace")
 
 
+def last_ts(raw):
+    """Epoch seconds of the timestamp a Codex record carries.
+
+    Codex stamps every record, in ISO-8601 UTC. Claude Code does not -- its
+    transcripts routinely end on an untimestamped bookkeeping record such as
+    last-prompt or cost-state -- which is one reason only Codex rows are timed
+    this way.
+    """
+    m = RE_TS.search(raw) if raw else None
+    if m is None:
+        return None
+    try:
+        return calendar.timegm(
+            time.strptime(m.group(1)[:19].decode(), "%Y-%m-%dT%H:%M:%S")
+        )
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 def clean(text):
     if not text:
         return ""
@@ -222,7 +241,7 @@ def codex_response_text(raw, role):
 
 def scan_codex(path):
     cwd = model = started = agent = None
-    first_prompt = last_prompt = last_reply = None
+    first_prompt = last_prompt = last_reply = last_line = None
     turns = 0
     active = False
 
@@ -273,6 +292,7 @@ def scan_codex(path):
                 m = RE_TS.search(line)
                 if m:
                     started = decode(m.group(1))
+            last_line = line
 
     uuid = RE_CODEX_UUID.search(path.stem)
     return {
@@ -282,6 +302,7 @@ def scan_codex(path):
         "branch": None,  # Codex records workspace roots, not the checked-out branch.
         "model": model,
         "started": started,
+        "ended": last_ts(last_line),
         "turns": turns,
         "title": clean(codex_response_text(first_prompt[0], "user")
                        if isinstance(first_prompt, tuple)
@@ -571,6 +592,7 @@ _SCAN_CACHE = {}
 
 def collect(tools):
     rows, skipped = [], 0
+    now = time.time()
     sources = []
     if "claude" in tools and CLAUDE_ROOT.is_dir():
         sources += [(p, scan_claude) for p in CLAUDE_ROOT.glob("*/*.jsonl")]
@@ -596,32 +618,45 @@ def collect(tools):
                 continue
             _SCAN_CACHE[key] = (st.st_mtime_ns, st.st_size, dict(row))
 
-        # mtime is the last write, which is exactly last activity, and free.
-        row["last"] = st.st_mtime
+        # mtime is the last write, which is exactly last activity, and free --
+        # everywhere but Windows, where the directory entry is left alone while
+        # the writer holds the file open and only stamped on close. That is
+        # wrong in both directions for a Codex rollout, whose liveness is read
+        # off this: a session mid-turn stats minutes stale and vanishes from the
+        # table, and one that quit an hour ago stats as "just now" and comes
+        # back as busy. The stamp Codex writes into the record itself cannot
+        # drift that way, so prefer it, and never trust a time in the future.
+        # Claude rows keep mtime: their liveness comes from the process
+        # registry, not from here.
+        row["last"] = min(row.get("ended") or st.st_mtime, now)
         rows.append(row)
 
     reg = live_claude() if "claude" in tools else {}
     codex_live = live_codex() if "codex" in tools else set()
-    now = time.time()
     for row in rows:
         if row["tool"] == "claude":
             row["live"] = reg.get(row["id"])
+            continue
+
+        # `active` only says the transcript ends on a task_started with no
+        # matching completion, and about one turn in twenty ends without
+        # writing one -- interrupted, superseded, or killed mid-turn. That
+        # shape then stays on disk for good, so on its own `active` reports a
+        # session that stopped working in April as busy in August. A turn that
+        # is genuinely running writes as it goes, so a transcript nobody has
+        # touched in HEARTBEAT seconds is over, however it ended.
+        running = row.get("active") and now - row["last"] <= HEARTBEAT
+
+        if row["id"] in codex_live:
+            # The lock proves the TUI is open; the transcript says whether it
+            # is working. An open session that is not is idle, not busy.
+            row["live"] = {"status": "busy" if running else "idle"}
         else:
-            if row["id"] in codex_live:
-                row["live"] = {"status": "busy" if row.get("active") else "idle"}
-            else:
-                # Keep active-turn detection as a fallback where lsof is not
-                # present or the host prevents process inspection.
-                #
-                # Bound it by recency. `active` only says the transcript ends on
-                # a task_started with no matching completion, and a session
-                # killed mid-turn leaves that shape on disk permanently --
-                # unbounded, a session that died in April still reads as busy in
-                # August. A turn that is genuinely running writes as it goes, so
-                # a transcript nobody has touched in HEARTBEAT seconds is over,
-                # however it ended.
-                running = row.get("active") and now - row["last"] <= HEARTBEAT
-                row["live"] = {"status": "busy"} if running else None
+            # Fallback where lsof is absent -- Windows -- or the host prevents
+            # process inspection: a turn in progress is the only live signal
+            # left, and an open but idle TUI is indistinguishable from a closed
+            # one.
+            row["live"] = {"status": "busy"} if running else None
 
     # Live first, then most recent. An idle session you left open is worth more
     # than a finished one that happened to be written to a minute later.
@@ -756,7 +791,13 @@ def build_table(rows, now, show_model, width, paint=False, exchange=False):
             return tint(padded, r["tool"])
         if col == "LIVE":
             state = live_state(r)
-            return tint(padded, state if r["live"] else "dim")
+            if not r["live"]:
+                return tint(padded, "dim")
+            # Both tools add status values over time -- `shell` is one Claude
+            # Code writes now. An unrecognised one still names a running
+            # session, so it takes the generic live colour rather than
+            # rendering uncoloured next to the dead rows.
+            return tint(padded, state if state in ANSI else "live")
         # You wrote the prompt; the reply is the part worth reading.
         if col in ("LAST", "TURNS", "BRANCH", "PROMPT"):
             return tint(padded, "dim")
