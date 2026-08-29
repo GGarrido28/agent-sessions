@@ -159,7 +159,7 @@ Both formats are newline-delimited JSON written without spacing, so the scan pul
 
 **Not every Codex turn writes its own ending.** About one turn in twenty ends with neither `task_complete` nor `turn_aborted` -- interrupted, superseded by the next prompt, or killed mid-turn -- and the transcript then ends on a bare `task_started` for good. Taken at face value that reads as a turn still running, so a session that stopped working in April reports `busy` in August. A turn that is genuinely running writes as it goes, so how long the transcript has been quiet is what settles it -- against two different windows, because the two cases have different evidence to work with.
 
-With no lock signal, an in-progress turn is the only sign of life there is, so the window is five minutes and a session that goes quieter than that drops out of the table. With one, the TUI is already proven open and the only thing left to catch is a turn abandoned without writing its completion, so the window is a day. It has to be that wide: turns go quiet for long stretches perfectly legitimately, and in a 4396-turn corpus 3.7% contained a silent stretch past five minutes, the longest running 23.7 hours. At five minutes that branch called one working session in twenty-seven `idle`, which is the worse error -- an abandoned turn reading `busy` until the day is up costs you less than a session you are watching being reported as finished.
+With no lock signal, an in-progress turn is the only sign of life there is, so the window is five minutes and a session that goes quieter than that drops out of the table. With one, the TUI is already proven open and the only thing left to catch is a turn abandoned without writing its completion, so the window is two days. It has to be that wide: turns go quiet for long stretches perfectly legitimately, and in a 4396-turn corpus 3.7% contained a silent stretch past five minutes, the longest running 23.7 hours. At five minutes that branch called one working session in twenty-seven `idle`, which is the worse error -- an abandoned turn reading `busy` for a while costs you less than a session you are watching being reported as finished.
 
 ## Tests
 
@@ -171,7 +171,7 @@ Stdlib only, no dependencies. The suite covers the liveness matrix -- each case 
 
 ## Limits
 
-- With a held lock, a turn abandoned without writing its completion reads `busy` until it has been quiet for a day. See above for why that is the right side to err on.
+- With a held lock, a turn abandoned without writing its completion reads `busy` until it has been quiet for two days. See above for why that is the right side to err on.
 - Codex liveness requires `lsof` to distinguish an open idle TUI from stale lock files. Active turns remain detectable from the transcript when `lsof` is unavailable, so on Windows a Codex session shows up while it is working and drops out of the table between turns.
 - Codex records workspace roots rather than the checked-out branch, so `BRANCH` is empty for Codex rows.
 - Watch mode needs a terminal and exits with a message when stdout is not a tty.

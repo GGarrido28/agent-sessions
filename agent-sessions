@@ -35,6 +35,9 @@ RE_CWD = re.compile(rb'"cwd":"((?:[^"\\]|\\.)*)"')
 RE_BRANCH = re.compile(rb'"gitBranch":"((?:[^"\\]|\\.)*)"')
 RE_MODEL = re.compile(rb'"model":"((?:[^"\\]|\\.)*)"')
 RE_TS = re.compile(rb'"timestamp":"([^"]+)"')
+# Anchored at the seconds field, so it takes the fraction and stops at whatever
+# follows it -- a Z, or the offset form that rstripping a Z would swallow.
+RE_FRACTION = re.compile(rb"\.(\d{1,6})")
 RE_SESSION_ID = re.compile(rb'"session_id":"([^"]+)"')
 
 # A user line carries promptSource only when it is a real prompt; tool results
@@ -104,8 +107,9 @@ def last_ts(raw):
         return None
     # Keep the fraction. mtime carries one, and a Codex row truncated down to
     # a whole second sorts below a Claude row written in the same second.
-    digits = stamp[20:].rstrip(b"Z")[:6]
-    if stamp[19:20] == b"." and digits.isdigit():
+    frac = RE_FRACTION.match(stamp[19:])
+    if frac:
+        digits = frac.group(1)
         epoch += int(digits) / 10.0 ** len(digits)
     return epoch
 
@@ -348,9 +352,13 @@ HEARTBEAT = 300
 # and has to be. Turns go quiet for long stretches perfectly legitimately, on a
 # build, a stalled model, or a run left going overnight: across a 4396-turn
 # corpus 3.7% of turns contain a silent stretch longer than HEARTBEAT and the
-# longest ran 23.7 hours, while none reached a day. At 300s that branch called
-# one working session in twenty-seven idle.
-STALE_TURN = 86400
+# longest ran 23.7 hours. At 300s that branch called one working session in
+# twenty-seven idle.
+#
+# Two days, not one: a day clears the longest turn on record by an hour, which
+# is no margin at all for a bound whose whole job is to be generous. Waiting an
+# extra day to notice an abandoned turn costs nothing by comparison.
+STALE_TURN = 2 * 86400
 
 
 # 100-nanosecond ticks between the FILETIME epoch (1601) and the Unix one.
@@ -730,7 +738,9 @@ ANSI = {
 # ANSI also holds keys that are not statuses -- dim, reset, the tool names --
 # and a status colliding with one of those would take its colour. `dim` is the
 # colour of a dead row, so that collision is the one that must not happen.
-LIVE_STATES = {"busy", "idle", "waiting", "live"}
+# Derived rather than restated: a status colour added to ANSI alone would
+# otherwise keep rendering as generic `live`.
+LIVE_STATES = set(ANSI) - {"reset", "dim", "claude", "codex"}
 
 
 def live_state(row):

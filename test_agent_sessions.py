@@ -33,8 +33,27 @@ def iso(epoch):
 
 
 def jsonl(records):
-    """Compact, the way both tools write it -- the scan matches raw bytes."""
-    return "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+    """Compact, the way both tools write it -- the scan matches raw bytes.
+
+    Bytes rather than text: write_text would turn these into CRLF on Windows
+    and the fixtures would stop being byte-identical to a real transcript.
+    """
+    return "".join(
+        json.dumps(r, separators=(",", ":")) + "\n" for r in records
+    ).encode()
+
+
+
+def patch(target, **values):
+    """Set module globals for one test and put the originals back after.
+
+    Without this a later test that forgets to patch would read the real
+    ~/.codex and shell out to lsof or ps.
+    """
+    for name, value in values.items():
+        original = getattr(ags, name)
+        target.addCleanup(setattr, ags, name, original)
+        setattr(ags, name, value)
 
 
 class LastTs(unittest.TestCase):
@@ -50,6 +69,26 @@ class LastTs(unittest.TestCase):
         # written in the same second, so the fraction has to survive.
         raw = b'{"timestamp":"2026-08-29T18:12:15.983Z"}'
         self.assertAlmostEqual(ags.last_ts(raw) % 1, 0.983, places=3)
+
+    def test_keeps_the_fraction_of_an_offset_form_stamp(self):
+        # Not a shape either tool writes today, but rstripping a trailing Z
+        # would have swallowed the offset digits along with the fraction.
+        raw = b'{"timestamp":"2026-08-29T18:12:15.983+00:00"}'
+        self.assertAlmostEqual(ags.last_ts(raw) % 1, 0.983, places=3)
+
+    def test_a_malformed_fraction_never_costs_the_second(self):
+        second = calendar.timegm((2026, 8, 29, 18, 12, 15, 0, 0, 0))
+        # Nothing to read: the second stands on its own.
+        for raw in (
+            b'{"timestamp":"2026-08-29T18:12:15.Z"}',
+            b'{"timestamp":"2026-08-29T18:12:15,983Z"}',
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(ags.last_ts(raw), second)
+        # A stamp torn mid-fraction keeps the digits it did get.
+        self.assertAlmostEqual(
+            ags.last_ts(b'{"timestamp":"2026-08-29T18:12:15.98xZ"}'),
+            second + 0.98, places=3)
 
     def test_stamp_without_a_fraction(self):
         raw = b'{"timestamp":"2026-08-29T18:12:15Z"}'
@@ -80,12 +119,14 @@ class LiveCell(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.day = self.tmp / "sessions" / "2026" / "08" / "29"
         self.day.mkdir(parents=True)
-        ags.CODEX_ROOT = self.tmp / "sessions"
-        ags.CLAUDE_ROOT = self.tmp / "claude"
-        ags._SCAN_CACHE.clear()
         self.locked = set()
-        ags.live_codex = lambda: self.locked
-        ags.live_claude = lambda: {}
+        patch(self,
+              CODEX_ROOT=self.tmp / "sessions",
+              CLAUDE_ROOT=self.tmp / "claude",
+              live_codex=lambda: self.locked,
+              live_claude=lambda: {})
+        ags._SCAN_CACHE.clear()
+        self.addCleanup(ags._SCAN_CACHE.clear)
         self.n = 0
 
     def rollout(self, ends_with=None, quiet=5, mtime_age=None):
@@ -107,7 +148,7 @@ class LiveCell(unittest.TestCase):
              "payload": {"type": ends_with or "token_count", "turn_id": "t1"}},
         ]
         path = self.day / ("rollout-2026-08-29T00-00-00-%s.jsonl" % uid)
-        path.write_text(jsonl(records))
+        path.write_bytes(jsonl(records))
         stamp = now - (mtime_age if mtime_age is not None else quiet)
         os.utime(path, (stamp, stamp))
         return uid
@@ -148,7 +189,7 @@ class LiveCell(unittest.TestCase):
         self.check(self.rollout(quiet=900), "-", "busy")
 
     def test_turn_abandoned_days_ago(self):
-        self.check(self.rollout(quiet=2 * 86400), "-", "idle")
+        self.check(self.rollout(quiet=5 * 86400), "-", "idle")
 
     def test_quit_an_hour_ago_with_the_mtime_flushed_on_close(self):
         # Closing the file stamps the mtime with the close time, so mtime says
@@ -173,6 +214,30 @@ class LiveCell(unittest.TestCase):
             self.assertNotIn("ended", row)
             json.dumps(row)  # -j dumps these verbatim
 
+    def test_a_second_collect_reads_the_same_row_from_cache(self):
+        # The scan caches a copy of the row, and collect() mutates the copy it
+        # hands back. A pop or a clamp reaching into the cache would show up as
+        # the second call falling back to mtime.
+        uid = self.rollout(quiet=3600, mtime_age=1)
+        for call in range(3):
+            rows, _ = ags.collect({"codex"})
+            row = next(r for r in rows if r["id"] == uid)
+            with self.subTest(call=call):
+                self.assertNotIn("ended", row)
+                self.assertAlmostEqual(time.time() - row["last"], 3600, delta=5)
+
+    def test_an_epoch_zero_stamp_is_a_stamp_not_a_missing_one(self):
+        self.n += 1
+        uid = "00000000-0000-4000-8000-%012d" % self.n
+        path = self.day / ("rollout-2026-08-29T00-00-00-%s.jsonl" % uid)
+        path.write_bytes(jsonl([
+            {"timestamp": "1970-01-01T00:00:00.000Z", "type": "session_meta",
+             "payload": {"cwd": "/tmp/demo", "thread_source": "user"}},
+        ]))
+        rows, _ = ags.collect({"codex"})
+        row = next(r for r in rows if r["id"] == uid)
+        self.assertEqual(row["last"], 0)
+
     def test_last_is_never_in_the_future(self):
         uid = self.rollout(quiet=-3600)  # a stamp an hour ahead of the clock
         rows, _ = ags.collect({"codex"})
@@ -189,16 +254,18 @@ class ClaudeRowsKeepMtime(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         proj = self.tmp / "claude" / "C--tmp-demo"
         proj.mkdir(parents=True)
-        ags.CLAUDE_ROOT = self.tmp / "claude"
-        ags.CODEX_ROOT = self.tmp / "none"
+        patch(self,
+              CLAUDE_ROOT=self.tmp / "claude",
+              CODEX_ROOT=self.tmp / "none",
+              live_claude=lambda: {},
+              live_codex=lambda: set())
         ags._SCAN_CACHE.clear()
-        ags.live_claude = lambda: {}
-        ags.live_codex = lambda: set()
+        self.addCleanup(ags._SCAN_CACHE.clear)
         self.path = proj / "cf3dd505-93c9-47b8-9a5c-dc6d43a83014.jsonl"
 
     def test_last_comes_from_mtime_not_the_final_record(self):
         old = time.time() - 90 * 86400
-        self.path.write_text(jsonl([
+        self.path.write_bytes(jsonl([
             {"timestamp": iso(old), "type": "user", "promptSource": "typed",
              "cwd": "/tmp/demo", "message": {"role": "user", "content": "hi"}},
             {"type": "last-prompt", "lastPrompt": "hi", "sessionId": "x"},
