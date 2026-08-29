@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""Unified view of local coding-agent sessions.
+
+Reads transcripts straight off disk. No API key, no network, no daemon.
+
+  Claude Code  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+  Codex        ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
+
+Both tools write newline-delimited JSON with no spacing, so the scan pulls
+fields with regex and only parses the handful of lines it actually needs.
+That keeps a full sweep well under a second even at ~100MB of transcripts.
+
+Claude liveness comes from ~/.claude/sessions/<pid>.json. Codex liveness comes
+from writer locks held open for the TUI lifetime, while transcript lifecycle
+events distinguish an active turn from an idle session.
+"""
+
+import argparse
+import calendar
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CLAUDE_ROOT = Path.home() / ".claude" / "projects"
+CLAUDE_LIVE = Path.home() / ".claude" / "sessions"
+CODEX_ROOT = Path.home() / ".codex" / "sessions"
+CODEX_LOCKS = Path.home() / ".codex" / "thread-writer-locks"
+
+RE_CWD = re.compile(rb'"cwd":"((?:[^"\\]|\\.)*)"')
+RE_BRANCH = re.compile(rb'"gitBranch":"((?:[^"\\]|\\.)*)"')
+RE_MODEL = re.compile(rb'"model":"((?:[^"\\]|\\.)*)"')
+RE_TS = re.compile(rb'"timestamp":"([^"]+)"')
+RE_SESSION_ID = re.compile(rb'"session_id":"([^"]+)"')
+
+# A user line carries promptSource only when it is a real prompt; tool results
+# have none. "system" is injected rather than asked for, so it is not a turn.
+# The rest (typed, suggestion_accepted, queued, sdk) all count.
+CLAUDE_PROMPT = b'"promptSource":"'
+CLAUDE_PROMPT_SKIP = b'"promptSource":"system"'
+CLAUDE_TITLE = b'"type":"ai-title"'
+CLAUDE_ASSISTANT = b'"type":"assistant"'
+CLAUDE_TEXT = b'"type":"text"'
+# Sub-agent turns share the parent's transcript. They are the agent talking to
+# itself, so they are not what the session last said to you.
+CLAUDE_SIDECHAIN = b'"isSidechain":true'
+CODEX_PROMPT = b'"type":"user_message"'
+CODEX_REPLY = b'"type":"agent_message"'
+CODEX_SETTINGS = b'"type":"thread_settings_applied"'
+CODEX_SUBAGENT = b'"thread_source":"subagent"'
+CODEX_RESPONSE = b'"type":"response_item"'
+CODEX_TASK_STARTED = b'"type":"task_started"'
+CODEX_TASK_COMPLETE = b'"type":"task_complete"'
+CODEX_TURN_ABORTED = b'"type":"turn_aborted"'
+
+# Prompts and replies are shown in one table cell, but a prompt can carry a
+# pasted file and a reply can run for pages. Cap what is kept so the cache does
+# not hold megabytes of text nobody will read.
+MAX_TEXT = 500
+
+RE_CODEX_UUID = re.compile(r"rollout-[\dT:-]+-([0-9a-f-]{36})$")
+RE_AGENT_NICK = re.compile(rb'"agent_nickname":"((?:[^"\\]|\\.)*)"')
+RE_AGENT_PATH = re.compile(rb'"agent_path":"((?:[^"\\]|\\.)*)"')
+
+# Slash-command and system-reminder wrappers make for useless titles.
+RE_STRIP = re.compile(
+    r"<(command-name|command-message|command-args|local-command-stdout|"
+    r"system-reminder)>.*?</\1>",
+    re.S,
+)
+
+
+def decode(raw):
+    """Turn a captured JSON string body back into text."""
+    if raw is None:
+        return None
+    try:
+        return json.loads(b'"' + raw + b'"')
+    except (ValueError, UnicodeDecodeError):
+        return raw.decode("utf-8", "replace")
+
+
+def clean(text):
+    if not text:
+        return ""
+    text = RE_STRIP.sub(" ", text)
+    text = " ".join(text.split())
+    return text[: MAX_TEXT - 1] + "…" if len(text) > MAX_TEXT else text
+
+
+def content_text(message):
+    """Pull display text out of a message whose content is a str or a block list."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content if isinstance(b, dict)]
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def claude_text(raw):
+    """Display text of a Claude transcript line, parsed only when asked.
+
+    Prompts and replies are wanted one per file -- the first and the last --
+    so the scan holds the raw line and parses it after the loop rather than
+    paying json.loads on every message it passes.
+    """
+    if raw is None:
+        return ""
+    try:
+        return content_text(json.loads(raw).get("message"))
+    except ValueError:
+        return ""
+
+
+def scan_claude(path):
+    sid = path.stem
+    cwd = branch = model = started = title = None
+    first_prompt = last_prompt = last_reply = None
+    turns = 0
+
+    with path.open("rb") as fh:
+        for line in fh:
+            if CLAUDE_PROMPT in line and CLAUDE_PROMPT_SKIP not in line:
+                turns += 1
+                if first_prompt is None:
+                    first_prompt = line
+                if CLAUDE_SIDECHAIN not in line:
+                    last_prompt = line
+            elif CLAUDE_ASSISTANT in line:
+                if model is None:
+                    m = RE_MODEL.search(line)
+                    if m:
+                        model = decode(m.group(1))
+                # An assistant turn is often nothing but a tool call. Keep the
+                # last one that actually said something.
+                if CLAUDE_TEXT in line and CLAUDE_SIDECHAIN not in line:
+                    last_reply = line
+            elif CLAUDE_TITLE in line:
+                try:
+                    # A session can be retitled; the last one written wins.
+                    title = json.loads(line).get("aiTitle") or title
+                except ValueError:
+                    pass
+
+            if cwd is None:
+                m = RE_CWD.search(line)
+                if m:
+                    cwd = decode(m.group(1))
+                    b = RE_BRANCH.search(line)
+                    branch = decode(b.group(1)) if b else None
+            if started is None:
+                m = RE_TS.search(line)
+                if m:
+                    started = decode(m.group(1))
+
+    return {
+        "tool": "claude",
+        "id": sid,
+        "cwd": cwd,
+        "branch": branch,
+        "model": model,
+        "started": started,
+        "turns": turns,
+        "title": clean(title) or clean(claude_text(first_prompt)),
+        "prompt": clean(claude_text(last_prompt)),
+        "reply": clean(claude_text(last_reply)),
+        "agent": None,  # Claude keeps sub-agent turns inline, not in their own file.
+        "path": str(path),
+    }
+
+
+def codex_text(raw, kind):
+    """Message body of a Codex event line, if it is the event kind asked for.
+
+    Sub-agent activity is relayed through the parent's rollout too, so the
+    payload type is checked rather than trusted from the substring match.
+    """
+    if raw is None:
+        return ""
+    try:
+        payload = json.loads(raw).get("payload")
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict) or payload.get("type") != kind:
+        return ""
+    message = payload.get("message")
+    return message if isinstance(message, str) else ""
+
+
+def codex_response_text(raw, role):
+    """Text from the response_item message format used by newer Codex builds."""
+    if raw is None:
+        return ""
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return ""
+    if event.get("type") != "response_item":
+        return ""
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "message":
+        return ""
+    if payload.get("role") != role:
+        return ""
+    parts = []
+    for block in payload.get("content") or []:
+        if isinstance(block, dict) and block.get("type") in ("input_text", "output_text"):
+            parts.append(block.get("text", ""))
+    text = " ".join(p for p in parts if p)
+    # Codex records environment setup as a user-role message. It is context,
+    # not a prompt the user typed, and should not become a session title/turn.
+    return "" if text.lstrip().startswith("<environment_context>") else text
+
+
+def scan_codex(path):
+    cwd = model = started = agent = None
+    first_prompt = last_prompt = last_reply = None
+    turns = 0
+    active = False
+
+    with path.open("rb") as fh:
+        for line in fh:
+            if CODEX_PROMPT in line:
+                turns += 1
+                if first_prompt is None:
+                    first_prompt = line
+                last_prompt = line
+            elif CODEX_REPLY in line:
+                last_reply = line
+            elif CODEX_RESPONSE in line:
+                prompt = codex_response_text(line, "user")
+                reply = codex_response_text(line, "assistant")
+                if prompt:
+                    turns += 1
+                    if first_prompt is None:
+                        first_prompt = (line, "response")
+                    last_prompt = (line, "response")
+                elif reply:
+                    last_reply = (line, "response")
+            elif model is None and CODEX_SETTINGS in line:
+                m = RE_MODEL.search(line)
+                if m:
+                    model = decode(m.group(1))
+
+            if CODEX_TASK_STARTED in line:
+                active = True
+            elif CODEX_TASK_COMPLETE in line or CODEX_TURN_ABORTED in line:
+                active = False
+
+            # Codex spawns each sub-agent into its own rollout file, and stamps
+            # the PARENT's id into session_meta. Name it off the filename uuid so
+            # a fan-out does not read as four copies of one session.
+            if agent is None and CODEX_SUBAGENT in line:
+                nick = RE_AGENT_NICK.search(line)
+                apath = RE_AGENT_PATH.search(line)
+                agent = decode(nick.group(1)) if nick else "subagent"
+                if apath:
+                    agent += " " + decode(apath.group(1)).rsplit("/", 1)[-1]
+
+            if cwd is None:
+                m = RE_CWD.search(line)
+                if m:
+                    cwd = decode(m.group(1))
+            if started is None:
+                m = RE_TS.search(line)
+                if m:
+                    started = decode(m.group(1))
+
+    uuid = RE_CODEX_UUID.search(path.stem)
+    return {
+        "tool": "codex",
+        "id": uuid.group(1) if uuid else path.stem,
+        "cwd": cwd,
+        "branch": None,  # Codex records workspace roots, not the checked-out branch.
+        "model": model,
+        "started": started,
+        "turns": turns,
+        "title": clean(codex_response_text(first_prompt[0], "user")
+                       if isinstance(first_prompt, tuple)
+                       else codex_text(first_prompt, "user_message")),
+        "prompt": clean(codex_response_text(last_prompt[0], "user")
+                        if isinstance(last_prompt, tuple)
+                        else codex_text(last_prompt, "user_message")),
+        "reply": clean(codex_response_text(last_reply[0], "assistant")
+                       if isinstance(last_reply, tuple)
+                       else codex_text(last_reply, "agent_message")),
+        "agent": agent,
+        "active": active,
+        "path": str(path),
+    }
+
+
+# A session that exits cleanly deletes its own registry file. One that is
+# killed, crashes, or leaves its process running past the end of the session
+# cannot, so the file is a claim, not proof. HEARTBEAT is how long a claim
+# stands without a refresh. Refreshes are irregular -- a median of ~15s but
+# gaps past a minute on a session mid-turn -- so this sits several times the
+# worst gap observed, and errs towards showing a session that might be gone
+# over hiding one that is running.
+HEARTBEAT = 300
+
+
+def proc_table(pids):
+    """Map pid -> (start time in epoch seconds, command), for the given pids.
+
+    The start time is what makes a pid trustworthy. pids get recycled, so
+    "pid 3480 exists" says nothing about whether it is still the process the
+    registry meant; "pid 3480 started at the second the registry recorded"
+    says exactly that.
+
+    Returns None if ps could not be run at all, which is different from a pid
+    being absent: one means unknown, the other means dead.
+    """
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,lstart=,comm="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    procs = {}
+    for line in out.splitlines():
+        # "  3480 Thu Aug 13 09:04:55 2026 claude" -- lstart is 5 fields of
+        # local time, and comm can itself contain spaces, so it takes the rest.
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        # Machines run hundreds of processes and we care about a handful, so
+        # skip the date parsing, which is the expensive part, for the rest.
+        if pid not in pids:
+            continue
+        try:
+            # mktime, not timegm: ps prints local time, and strptime leaves
+            # tm_isdst at -1 so mktime resolves the offset for that date.
+            start = time.mktime(
+                time.strptime(" ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y")
+            )
+        except (ValueError, OverflowError):
+            continue
+        procs[pid] = (start, " ".join(parts[6:]))
+    return procs
+
+
+def parse_proc_start(text):
+    """procStart as written by Claude Code: a ctime-style stamp in UTC."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return calendar.timegm(time.strptime(text, "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
+
+
+def fresh(entry, mtime, now):
+    """Has this registry entry been refreshed recently enough to still count?
+
+    Only versions that heartbeat report updatedAt. Older ones write the file
+    once at startup and never touch it again, so for those an old file says
+    nothing and liveness rests on the process check alone.
+    """
+    beat = entry.get("updatedAt") or entry.get("statusUpdatedAt")
+    if not isinstance(beat, (int, float)):
+        return True
+    # The file itself is rewritten on every beat, so its mtime is the same
+    # clock the rest of the tool uses and sidesteps any skew in the stamp.
+    return now - max(beat / 1000, mtime) <= HEARTBEAT
+
+
+def live_claude():
+    """Map sessionId -> live process info for Claude Code sessions running now.
+
+    Claude Code writes ~/.claude/sessions/<pid>.json per running process, giving
+    an exact pid-to-sessionId mapping. An entry counts as live only when its pid
+    is running, that process started when the entry says it did, and the entry
+    is still being refreshed. Each check kills a different way a closed session
+    lingers: a leftover file, a recycled pid, and a process that outlives the
+    session it registered.
+
+    Codex has no comparable JSON process registry. Its zero-byte writer locks
+    are handled separately by live_codex(), which checks open descriptors
+    rather than treating persistent lock files as proof of life.
+    """
+    if not CLAUDE_LIVE.is_dir():
+        return {}
+
+    entries = []
+    for f in CLAUDE_LIVE.glob("*.json"):
+        try:
+            mtime = f.stat().st_mtime
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("sessionId") and isinstance(d.get("pid"), int):
+            entries.append((d, mtime))
+
+    procs = proc_table({d["pid"] for d, _ in entries})
+    if procs is None:
+        return {}
+
+    now = time.time()
+    reg = {}
+    for d, mtime in entries:
+        sid, pid = d["sessionId"], d["pid"]
+        if pid not in procs:
+            continue
+        start, comm = procs[pid]
+
+        claimed = parse_proc_start(d.get("procStart"))
+        if claimed is None:
+            # No recorded start time to check against, so fall back to the
+            # weaker test: the pid at least has to belong to a claude process.
+            if "claude" not in comm.lower():
+                continue
+        # Whole seconds on both sides, so allow a second of rounding drift.
+        elif abs(start - claimed) > 1:
+            continue
+
+        if not fresh(d, mtime, now):
+            continue
+
+        reg[sid] = {
+            "pid": pid,
+            "status": d.get("status"),
+            "waiting_for": d.get("waitingFor"),
+            "name": d.get("name"),
+            "kind": d.get("kind"),
+        }
+    return reg
+
+
+def live_codex():
+    """Return thread ids whose writer lock is held by a running Codex process.
+
+    Lock files persist after Codex exits, so their mere existence proves
+    nothing. An open file does: Codex holds its thread's lock descriptor for
+    the lifetime of the session. lsof is available on macOS, where Codex uses
+    these locks; failure simply falls back to active-turn transcript events.
+    """
+    if not CODEX_LOCKS.is_dir():
+        return set()
+    try:
+        out = subprocess.run(
+            ["lsof", "-Fn", "+D", str(CODEX_LOCKS)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+    live = set()
+    for line in out.splitlines():
+        if not line.startswith("n"):
+            continue
+        path = Path(line[1:])
+        if path.parent != CODEX_LOCKS or path.suffix != ".lock":
+            continue
+        if re.fullmatch(r"[0-9a-f-]{36}", path.stem):
+            live.add(path.stem)
+    return live
+
+
+# Transcripts are append-only, so a file whose mtime and size are unchanged
+# cannot have new content. Caching on that makes a watch tick cost ~70 stat
+# calls instead of a full re-read of every transcript.
+_SCAN_CACHE = {}
+
+
+def collect(tools):
+    rows, skipped = [], 0
+    sources = []
+    if "claude" in tools and CLAUDE_ROOT.is_dir():
+        sources += [(p, scan_claude) for p in CLAUDE_ROOT.glob("*/*.jsonl")]
+    if "codex" in tools and CODEX_ROOT.is_dir():
+        sources += [(p, scan_codex) for p in CODEX_ROOT.glob("*/*/*/*.jsonl")]
+
+    for path, scanner in sources:
+        try:
+            st = path.stat()
+        except OSError:
+            skipped += 1
+            continue
+
+        key = str(path)
+        cached = _SCAN_CACHE.get(key)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            row = dict(cached[2])
+        else:
+            try:
+                row = scanner(path)
+            except OSError:
+                skipped += 1
+                continue
+            _SCAN_CACHE[key] = (st.st_mtime_ns, st.st_size, dict(row))
+
+        # mtime is the last write, which is exactly last activity, and free.
+        row["last"] = st.st_mtime
+        rows.append(row)
+
+    reg = live_claude() if "claude" in tools else {}
+    codex_live = live_codex() if "codex" in tools else set()
+    for row in rows:
+        if row["tool"] == "claude":
+            row["live"] = reg.get(row["id"])
+        else:
+            if row["id"] in codex_live:
+                row["live"] = {"status": "busy" if row.get("active") else "idle"}
+            else:
+                # Keep active-turn detection as a fallback where lsof is not
+                # present or the host prevents process inspection.
+                row["live"] = {"status": "busy"} if row.get("active") else None
+
+    # Live first, then most recent. An idle session you left open is worth more
+    # than a finished one that happened to be written to a minute later.
+    rows.sort(key=lambda r: (r["live"] is None, -r["last"]))
+    return rows, skipped
+
+
+def rel_time(epoch, now):
+    delta = now - epoch
+    if delta < 3600:
+        return f"{max(int(delta // 60), 0)}m"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h"
+    if delta < 7 * 86400:
+        return f"{int(delta // 86400)}d"
+    return time.strftime("%m-%d", time.localtime(epoch))
+
+
+# 256-color rather than truecolor. Apple Terminal exports COLORTERM=truecolor
+# but does not actually render 24-bit sequences; 256 is what it really supports,
+# and every other modern terminal handles it too.
+ANSI = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "claude": "\033[38;5;208m",     # orange
+    "codex": "\033[38;5;75m",       # blue
+    "busy": "\033[38;5;42m",        # green, actively working
+    "idle": "\033[38;5;214m",       # amber, open but doing nothing
+    "waiting": "\033[1;38;5;203m",  # red bold, blocked on you
+    "live": "\033[38;5;80m",        # cyan, running but status unreported
+}
+
+
+def live_state(row):
+    """LIVE cell text. A running session whose registry entry carries no status
+    still has to read as running, not as a dash indistinguishable from dead."""
+    if not row["live"]:
+        return "-"
+    return row["live"].get("status") or "live"
+
+
+def use_color(choice):
+    if choice in ("always", "never"):
+        return choice == "always"
+    return (
+        sys.stdout.isatty()
+        and not os.environ.get("NO_COLOR")
+        and os.environ.get("TERM", "") != "dumb"
+    )
+
+
+def tint(text, key, paint=True):
+    """Wrap text in a colour, or return it untouched when colour is off."""
+    if not paint or not text or key not in ANSI:
+        return text
+    return f"{ANSI[key]}{text}{ANSI['reset']}"
+
+
+MAX_DIR = 34
+
+
+def short_dir(cwd):
+    if not cwd:
+        return "-"
+    home = str(Path.home())
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+    # The tail of a path identifies it; the head is boilerplate. Trim the head.
+    return cwd if len(cwd) <= MAX_DIR else "…" + cwd[-(MAX_DIR - 1):]
+
+
+def short_model(model):
+    if not model:
+        return "-"
+    return model.replace("claude-", "").replace("-20", " ")[:14]
+
+
+# Floor on the room the text columns get in total, not each. Two columns in a
+# window too narrow for them should crowd each other, not overflow the line and
+# wrap, which in watch mode would push the redraw off its fixed position.
+MIN_TEXT_ROOM = 20
+
+
+def build_table(rows, now, show_model, width, paint=False, exchange=False):
+    cols = ["TOOL", "LIVE", "LAST", "TURNS", "DIR", "BRANCH"]
+    if show_model:
+        cols.append("MODEL")
+    # The free-text columns come last, and are the only ones that stretch.
+    cols += ["PROMPT", "REPLY"] if exchange else ["TITLE"]
+    flex = 2 if exchange else 1
+
+    table = []
+    for r in rows:
+        tool = r["tool"]
+        if r["agent"]:
+            tool += "▸" + r["agent"].split(" ", 1)[0]
+        cells = [
+            tool,
+            live_state(r),
+            rel_time(r["last"], now),
+            str(r["turns"]),
+            short_dir(r["cwd"]),
+            r["branch"] or "-",
+        ]
+        if show_model:
+            cells.append(short_model(r["model"]))
+        if exchange:
+            cells += [r["prompt"] or "-", r["reply"] or "-"]
+        else:
+            cells.append(r["title"] or "(no prompt)")
+        table.append(cells)
+
+    fixed = len(cols) - flex
+    widths = [len(c) for c in cols]
+    for cells in table:
+        for i in range(fixed):
+            widths[i] = max(widths[i], len(cells[i]))
+
+    used = sum(widths[:fixed]) + 2 * (len(cols) - 1)
+    room = max(width - used - 2, MIN_TEXT_ROOM)
+    # Split evenly: a prompt and the reply to it are worth the same space.
+    for i in range(flex):
+        share = room // (flex - i)
+        widths[fixed + i] = share
+        room -= share
+
+    # Colour is applied AFTER padding. Escape codes have no display width, so
+    # padding a coloured string would throw every column out of alignment.
+    def style(idx, padded, r):
+        col = cols[idx]
+        if col == "TOOL":
+            return tint(padded, r["tool"])
+        if col == "LIVE":
+            state = live_state(r)
+            return tint(padded, state if r["live"] else "dim")
+        # You wrote the prompt; the reply is the part worth reading.
+        if col in ("LAST", "TURNS", "BRANCH", "PROMPT"):
+            return tint(padded, "dim")
+        return padded
+
+    def line(cells, r=None):
+        out = []
+        last = len(cells) - 1
+        for i, (c, w) in enumerate(zip(cells, widths)):
+            if len(c) > w:
+                c = c[: w - 1] + "…"
+            padded = c if i == last else c.ljust(w)
+            out.append(style(i, padded, r) if (paint and r) else padded)
+        text = "  ".join(out).rstrip()
+        return tint(text, "dim") if (paint and r is None) else text
+
+    return [line(cols)] + [line(c, r) for c, r in zip(table, rows)]
+
+
+def render(rows, now, show_model, paint, exchange):
+    width = max(shutil.get_terminal_size((120, 24)).columns, 60)
+    for line in build_table(rows, now, show_model, width, paint, exchange):
+        print(line)
+
+
+def filter_scope(rows, args):
+    """Filters deciding which sessions are in scope at all."""
+    hidden = 0
+    if not args.subagents:
+        before = len(rows)
+        rows = [r for r in rows if not r["agent"]]
+        hidden = before - len(rows)
+    if args.cwd:
+        needle = args.cwd.lower()
+        rows = [r for r in rows if needle in (r["cwd"] or "").lower()]
+    if args.search:
+        needle = args.search.lower()
+        rows = [r for r in rows if needle in (r["title"] or "").lower()]
+    return rows, hidden
+
+
+def filter_view(rows, args, now):
+    """Filters that only trim what gets displayed."""
+    if not args.history:
+        rows = [r for r in rows if r["live"]]
+    if args.days:
+        cutoff = now - args.days * 86400
+        rows = [r for r in rows if r["last"] >= cutoff]
+    if not args.all:
+        rows = rows[: args.limit]
+    return rows
+
+
+def fit(plain, colored, width):
+    """Use the coloured string only when the plain one fits.
+
+    Truncating a coloured string can slice an escape sequence in half, or drop
+    the reset and bleed colour across the rest of the screen. When the text is
+    too long, fall back to plain text and cut that instead.
+    """
+    return colored if len(plain) <= width else plain[:width]
+
+
+def watch(tools, args, interval, paint):
+    """Redraw the table on an interval until interrupted."""
+    if not sys.stdout.isatty():
+        print("--watch needs a terminal.", file=sys.stderr)
+        return 1
+
+    sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen, hide cursor
+    try:
+        while True:
+            rows, _ = collect(tools)
+            scoped, _hidden = filter_scope(rows, args)
+            now = time.time()
+
+            # A terminal can report 0x0 (a freshly forked pty does). Clamp, or
+            # every line truncates to nothing and the screen goes blank.
+            width = max(shutil.get_terminal_size((120, 24)).columns, 60)
+
+            view = filter_view(scoped, args, now)
+            table = build_table(view, now, args.model, width, paint, args.exchange)
+
+            # Counted off the scoped set rather than the view, so a row trimmed
+            # by -n or -d still counts as a session you have running.
+            live = [r["live"] for r in scoped if r["live"]]
+            n_wait = sum(1 for s in live if s.get("status") == "waiting")
+            lead = f"agent-sessions  {time.strftime('%H:%M:%S')}  {len(live)} live"
+            alert = f", {n_wait} waiting on you" if n_wait else ""
+            trail = f"  ·  {interval:g}s  ·  Ctrl-C to quit"
+            head = fit(
+                lead + alert + trail,
+                tint(lead, "dim", paint) + tint(alert, "waiting", paint)
+                + tint(trail, "dim", paint),
+                width,
+            )
+
+            # No blanket truncation here: these lines already fit, and slicing a
+            # coloured string can cut an escape sequence in half.
+            sys.stdout.write("\033[H" + "\n".join([head, ""] + table) + "\033[J")
+            sys.stdout.flush()
+            time.sleep(interval)
+    finally:
+        sys.stdout.write("\033[?25h\033[?1049l")  # restore cursor and screen
+        sys.stdout.flush()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="agent-sessions",
+        description="One view of every local Claude Code and Codex session.",
+    )
+    ap.add_argument("-C", "--cwd", help="only sessions whose working dir contains this")
+    ap.add_argument("-t", "--tool", choices=["claude", "codex"], help="limit to one tool")
+    ap.add_argument("-d", "--days", type=float, help="only sessions active in the last N days")
+    ap.add_argument("-s", "--search", help="only sessions whose title contains this")
+    ap.add_argument("-S", "--subagents", action="store_true",
+                    help="include sub-agent threads (hidden by default)")
+    ap.add_argument("-H", "--history", action="store_true",
+                    help="include sessions that are not running (default: live only)")
+    # Live is the default now, so -L is redundant. Kept so it stays a no-op
+    # rather than an error for anyone who already has it in muscle memory.
+    ap.add_argument("-L", "--live", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("-w", "--watch", nargs="?", const=2.0, type=float,
+                    metavar="SECS",
+                    help="keep the table up, redrawing; default every 2s")
+    ap.add_argument("-n", "--limit", type=int, default=40, help="max rows (default 40)")
+    ap.add_argument("-a", "--all", action="store_true", help="no row limit")
+    ap.add_argument("-m", "--model", action="store_true", help="add a model column")
+    ap.add_argument("-e", "--exchange", action="store_true",
+                    help="show the last prompt and the agent's last reply "
+                         "instead of the title")
+    ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                    help="colourise output (default auto: on for a terminal)")
+    ap.add_argument("-j", "--json", action="store_true", help="emit JSON, full ids included")
+    ap.add_argument("-p", "--paths", action="store_true", help="print transcript paths only")
+    args = ap.parse_args()
+
+    tools = {args.tool} if args.tool else {"claude", "codex"}
+    paint = use_color(args.color)
+
+    if args.watch is not None:
+        return watch(tools, args, max(args.watch, 0.5), paint)
+
+    rows, skipped = collect(tools)
+    now = time.time()
+    rows, hidden = filter_scope(rows, args)
+    rows = filter_view(rows, args, now)
+
+    if args.json:
+        for r in rows:
+            # Offset included so it does not read as UTC next to `started`.
+            r["last_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(r["last"]))
+        json.dump(rows, sys.stdout, indent=2)
+        print()
+    elif args.paths:
+        for r in rows:
+            print(r["path"])
+    elif not rows:
+        if args.history:
+            print("No sessions matched.", file=sys.stderr)
+        else:
+            print("No live sessions. -H includes history.", file=sys.stderr)
+        return 1
+    else:
+        render(rows, now, args.model, paint, args.exchange)
+        notes = []
+        if hidden:
+            notes.append(f"{hidden} sub-agent thread(s) hidden, -S to show")
+        if skipped:
+            notes.append(f"{skipped} transcript(s) unreadable")
+        if notes:
+            sys.stdout.flush()  # keep the note below the table, not racing it
+            print("\n" + "; ".join(notes), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
