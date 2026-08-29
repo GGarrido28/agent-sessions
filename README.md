@@ -23,6 +23,40 @@ ln -s ~/code/agent-sessions/agent-sessions ~/.local/bin/agent-sessions
 
 Any directory on your `PATH` works.
 
+### Windows
+
+The symlink above relies on the `#!/usr/bin/env python3` shebang, which fails on
+most Windows Python installs — they ship `python.exe`, not `python3`, so the
+script is found but the interpreter is not. Write a small wrapper instead of a
+symlink, in a directory already on your `PATH` such as `~/.local/bin`.
+
+For Git Bash, an extensionless file:
+
+```sh
+#!/usr/bin/env bash
+exec "/c/Path/To/python.exe" "/c/path/to/agent-sessions/agent-sessions" "$@"
+```
+
+For PowerShell and cmd, the same thing as `agent-sessions.cmd`:
+
+```bat
+@echo off
+"C:\Path\To\python.exe" "C:\path\to\agent-sessions\agent-sessions" %*
+```
+
+`python -c "import sys; print(sys.executable)"` prints the interpreter path to
+use. Note that these hardcode the paths, so moving the repo or upgrading Python
+means editing them.
+
+Claude sessions are detected through the Win32 process API, so their live
+status is exact. Codex has no process registry and `lsof` is not available on
+Windows, so Codex liveness falls back to reading the transcript for a turn in
+progress, and a session is only counted as running if its transcript was
+written to in the last five minutes.
+
+Watch mode uses the alternate-screen escape sequence. Windows Terminal, Ghostty,
+and VS Code render it correctly; the legacy `conhost.exe` console may not.
+
 ## Usage
 
 ```sh
