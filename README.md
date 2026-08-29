@@ -5,11 +5,11 @@ One view of every local Claude Code and Codex session, including which ones are 
 Reads transcripts straight off disk. No API key, no network, no daemon. That matters if you are on a Claude Max or Codex subscription and never issue API keys: the tools that need one are usage and cost dashboards, which are a different thing from a session viewer.
 
 ```
-TOOL    LIVE     LAST  TURNS  DIR                            BRANCH  TITLE
-claude  busy     0m    8      ~/Documents/GitHub/work-vault  main    Review Prelude repository
-claude  waiting  0m    21     ~/Documents/GitHub/work-vault  main    Analytics stack architecture
-claude  -        18h   36     ~/Documents/GitHub/work-vault  main    Explore Linear integration
-codex   -        08-05  20    ~/Documents/GitHub/analytics   -       Run co-change PR workflows
+TOOL    LIVE     LAST   TURNS  DIR                     BRANCH  TITLE
+claude  busy     0m     8      ~/code/web-app          main    Refactor the auth middleware
+claude  waiting  0m     21     ~/code/api-server       main    Add rate limiting to the API
+claude  -        18h    36     ~/code/web-app          main    Track down a flaky test
+codex   -        08-05  20     ~/code/data-pipeline    -       Backfill the events table
 ```
 
 ## Install
@@ -17,8 +17,8 @@ codex   -        08-05  20    ~/Documents/GitHub/analytics   -       Run co-chan
 Requires Python 3, standard library only.
 
 ```sh
-git clone <this repo> ~/Documents/GitHub/agent-sessions
-ln -s ~/Documents/GitHub/agent-sessions/agent-sessions ~/.local/bin/agent-sessions
+git clone https://github.com/GGarrido28/agent-sessions.git ~/code/agent-sessions
+ln -s ~/code/agent-sessions/agent-sessions ~/.local/bin/agent-sessions
 ```
 
 Any directory on your `PATH` works.
@@ -30,8 +30,8 @@ agent-sessions                 # what is running right now
 agent-sessions -H              # include history: everything, live first
 agent-sessions -w              # watch mode: stay up and log status changes
 agent-sessions -w 0.5          # faster tick; the floor is 0.5s
-agent-sessions -H -C analytics # only sessions whose working dir matches
-agent-sessions -H -s dashboard # title search
+agent-sessions -H -C api       # only sessions whose working dir matches
+agent-sessions -H -s rate      # title search
 agent-sessions -e              # last prompt and reply, in place of the title
 agent-sessions -H -d 7 -a      # last 7 days, no row cap
 agent-sessions -H -t codex -m  # one tool, with a model column
@@ -51,8 +51,8 @@ The ids in `-j` are what `claude --resume <id>` and `codex resume <id>` take, so
 ```
 agent-sessions  11:35:23  3 live, 1 waiting on you  ·  0.5s  ·  Ctrl-C to quit
 
-TOOL    LIVE     LAST  TURNS  DIR                            BRANCH  TITLE
-claude  busy     0m    8      ~/Documents/GitHub/work-vault  main    Review Prelude repository
+TOOL    LIVE     LAST   TURNS  DIR                     BRANCH  TITLE
+claude  busy     0m     8      ~/code/web-app          main    Refactor the auth middleware
 ...
 ```
 
@@ -63,10 +63,10 @@ The header counts every live session in scope, including any the row limit or `-
 A title tells you what a session was about. `-e` tells you where it is right now: your most recent prompt, and the last thing the agent said back. It takes the place of `TITLE`, and the two share the width evenly.
 
 ```
-TOOL    LIVE     LAST  TURNS  DIR                            BRANCH  PROMPT                     REPLY
-claude  busy     0m    8      ~/Documents/GitHub/work-vault  main    now do the same for th…    Reading the migration…
-claude  waiting  0m    21     ~/Documents/GitHub/work-vault  main    yes, drop the old table    This drops 14k rows. …
-codex   -        08-05  20    ~/Documents/GitHub/analytics   -       Actually, for formatti…    Done. The findings ta…
+TOOL    LIVE     LAST   TURNS  DIR                     BRANCH  PROMPT                   REPLY
+claude  busy     0m     8      ~/code/web-app          main    now do the same for th…  Reading the middleware…
+claude  waiting  0m     21     ~/code/api-server       main    yes, 100 requests per …  This would reject requ…
+codex   -        08-05  20     ~/code/data-pipeline    -       actually, for the back…  Done. The backfill ran…
 ```
 
 The prompt is dimmed and the reply is not, because the reply is the half you do not already know. Paired with `-w`, this is the view that tells you which session is worth switching to.
@@ -122,3 +122,7 @@ Both formats are newline-delimited JSON written without spacing, so the scan pul
 - Codex records workspace roots rather than the checked-out branch, so `BRANCH` is empty for Codex rows.
 - Watch mode needs a terminal and exits with a message when stdout is not a tty.
 - Read-only by design. It never writes to either tool's directories.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
