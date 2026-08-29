@@ -51,8 +51,15 @@ means editing them.
 Claude sessions are detected through the Win32 process API, so their live
 status is exact. Codex has no process registry and `lsof` is not available on
 Windows, so Codex liveness falls back to reading the transcript for a turn in
-progress, and a session is only counted as running if its transcript was
-written to in the last five minutes.
+progress, and a session is only counted as running if it wrote to its
+transcript in the last five minutes.
+
+That recency is measured from the timestamp on the transcript's last record,
+not the file's mtime, because Windows does not refresh a file's mtime while
+its writer holds it open. Reading mtime there gets it wrong in both
+directions: a session mid-turn stats several minutes stale and drops out of
+the table, and one that quit an hour ago picks up a fresh mtime when the
+handle finally closes and reappears as `busy`.
 
 Watch mode uses the alternate-screen escape sequence. Windows Terminal, Ghostty,
 and VS Code render it correctly; the legacy `conhost.exe` console may not.
@@ -150,9 +157,11 @@ Both formats are newline-delimited JSON written without spacing, so the scan pul
 
 **Codex lock files persist, but their open descriptors do not.** Codex holds its thread's file in `~/.codex/thread-writer-locks/` open for the lifetime of the TUI. The file remains after exit, so existence is not a live signal; `lsof` identifies the locks currently held open. Newer transcripts also bracket work with `task_started` and `task_complete`, separating `busy` from `idle` and providing a fallback when process inspection is unavailable.
 
+**Not every Codex turn writes its own ending.** About one turn in twenty ends with neither `task_complete` nor `turn_aborted` -- interrupted, superseded by the next prompt, or killed mid-turn -- and the transcript then ends on a bare `task_started` for good. Taken at face value that reads as a turn still running, so a session that stopped working in April reports `busy` in August. A turn that is genuinely running writes as it goes, so `busy` also requires the transcript to have been written to in the last five minutes, whether or not a held lock has already proved the TUI is open.
+
 ## Limits
 
-- Codex liveness requires `lsof` to distinguish an open idle TUI from stale lock files. Active turns remain detectable from the transcript when `lsof` is unavailable.
+- Codex liveness requires `lsof` to distinguish an open idle TUI from stale lock files. Active turns remain detectable from the transcript when `lsof` is unavailable, so on Windows a Codex session shows up while it is working and drops out of the table between turns.
 - Codex records workspace roots rather than the checked-out branch, so `BRANCH` is empty for Codex rows.
 - Watch mode needs a terminal and exits with a message when stdout is not a tty.
 - Read-only by design. It never writes to either tool's directories.
