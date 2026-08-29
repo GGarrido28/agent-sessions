@@ -308,6 +308,72 @@ def scan_codex(path):
 HEARTBEAT = 300
 
 
+# 100-nanosecond ticks between the FILETIME epoch (1601) and the Unix one.
+FILETIME_EPOCH = 116444736000000000
+
+
+def filetime_epoch(ticks):
+    """Windows FILETIME -> epoch seconds."""
+    return (ticks - FILETIME_EPOCH) / 10000000.0
+
+
+def proc_table_windows(pids):
+    """proc_table for Windows, asking the kernel rather than a shell.
+
+    Watch mode ticks as fast as twice a second, and spawning a PowerShell or
+    tasklist process per tick costs hundreds of milliseconds. GetProcessTimes
+    costs microseconds, and hands back the very FILETIME that Claude Code
+    records as procStart on Windows, so the start-time check is an exact
+    comparison instead of a reconstruction through a formatted date.
+
+    A pid we cannot open reads as absent. That is the honest answer for a
+    process that exited, and the conservative one for a process owned by
+    another user, which is not a session of ours to report on anyway.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.GetProcessTimes.argtypes = (
+        [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    )
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+    procs = {}
+    for pid in pids:
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            continue
+        try:
+            created, exited = wintypes.FILETIME(), wintypes.FILETIME()
+            kernel, user = wintypes.FILETIME(), wintypes.FILETIME()
+            if not k32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited),
+                ctypes.byref(kernel), ctypes.byref(user),
+            ):
+                continue
+            ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            comm = ""
+            if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                comm = buf.value.rsplit("\\", 1)[-1]
+            procs[pid] = (filetime_epoch(ticks), comm)
+        finally:
+            k32.CloseHandle(handle)
+    return procs
+
+
 def proc_table(pids):
     """Map pid -> (start time in epoch seconds, command), for the given pids.
 
@@ -316,18 +382,33 @@ def proc_table(pids):
     registry meant; "pid 3480 started at the second the registry recorded"
     says exactly that.
 
-    Returns None if ps could not be run at all, which is different from a pid
-    being absent: one means unknown, the other means dead.
+    Returns None if the process list could not be read at all, which is
+    different from a pid being absent: one means unknown, the other means dead.
     """
     if not pids:
         return {}
+
+    if os.name == "nt":
+        try:
+            return proc_table_windows(pids)
+        except (OSError, AttributeError, ValueError):
+            return None
+
     try:
-        out = subprocess.run(
+        run = subprocess.run(
             ["ps", "-eo", "pid=,lstart=,comm="],
             capture_output=True, text=True, timeout=5,
-        ).stdout
+        )
     except (OSError, subprocess.SubprocessError):
         return None
+
+    # A ps that runs but rejects these arguments -- MSYS2 ships one with no -o
+    # -- exits non-zero having printed nothing. Without this check that empty
+    # output parses into an empty table, which reads as "every pid is dead" and
+    # marks every running session dead. Unknown has to stay unknown.
+    if run.returncode != 0 or not run.stdout.strip():
+        return None
+    out = run.stdout
 
     procs = {}
     for line in out.splitlines():
@@ -357,9 +438,18 @@ def proc_table(pids):
 
 
 def parse_proc_start(text):
-    """procStart as written by Claude Code: a ctime-style stamp in UTC."""
+    """procStart as written by Claude Code.
+
+    POSIX builds write a ctime-style stamp in UTC. Windows builds write a raw
+    FILETIME integer instead, which is the same clock GetProcessTimes reports,
+    so the two compare exactly.
+    """
+    if isinstance(text, int) and not isinstance(text, bool):
+        return filetime_epoch(text)
     if not isinstance(text, str):
         return None
+    if text.isdigit():
+        return filetime_epoch(int(text))
     try:
         return calendar.timegm(time.strptime(text, "%a %b %d %H:%M:%S %Y"))
     except ValueError:
@@ -512,6 +602,7 @@ def collect(tools):
 
     reg = live_claude() if "claude" in tools else {}
     codex_live = live_codex() if "codex" in tools else set()
+    now = time.time()
     for row in rows:
         if row["tool"] == "claude":
             row["live"] = reg.get(row["id"])
@@ -521,7 +612,16 @@ def collect(tools):
             else:
                 # Keep active-turn detection as a fallback where lsof is not
                 # present or the host prevents process inspection.
-                row["live"] = {"status": "busy"} if row.get("active") else None
+                #
+                # Bound it by recency. `active` only says the transcript ends on
+                # a task_started with no matching completion, and a session
+                # killed mid-turn leaves that shape on disk permanently --
+                # unbounded, a session that died in April still reads as busy in
+                # August. A turn that is genuinely running writes as it goes, so
+                # a transcript nobody has touched in HEARTBEAT seconds is over,
+                # however it ended.
+                running = row.get("active") and now - row["last"] <= HEARTBEAT
+                row["live"] = {"status": "busy"} if running else None
 
     # Live first, then most recent. An idle session you left open is worth more
     # than a finished one that happened to be written to a minute later.
