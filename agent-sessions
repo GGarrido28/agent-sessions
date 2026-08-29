@@ -35,6 +35,9 @@ RE_CWD = re.compile(rb'"cwd":"((?:[^"\\]|\\.)*)"')
 RE_BRANCH = re.compile(rb'"gitBranch":"((?:[^"\\]|\\.)*)"')
 RE_MODEL = re.compile(rb'"model":"((?:[^"\\]|\\.)*)"')
 RE_TS = re.compile(rb'"timestamp":"([^"]+)"')
+# Anchored at the seconds field, so it takes the fraction and stops at whatever
+# follows it -- a Z, or the offset form that rstripping a Z would swallow.
+RE_FRACTION = re.compile(rb"\.(\d{1,6})")
 RE_SESSION_ID = re.compile(rb'"session_id":"([^"]+)"')
 
 # A user line carries promptSource only when it is a real prompt; tool results
@@ -95,12 +98,20 @@ def last_ts(raw):
     m = RE_TS.search(raw) if raw else None
     if m is None:
         return None
+    stamp = m.group(1)
     try:
-        return calendar.timegm(
-            time.strptime(m.group(1)[:19].decode(), "%Y-%m-%dT%H:%M:%S")
+        epoch = calendar.timegm(
+            time.strptime(stamp[:19].decode(), "%Y-%m-%dT%H:%M:%S")
         )
     except (ValueError, UnicodeDecodeError):
         return None
+    # Keep the fraction. mtime carries one, and a Codex row truncated down to
+    # a whole second sorts below a Claude row written in the same second.
+    frac = RE_FRACTION.match(stamp[19:])
+    if frac:
+        digits = frac.group(1)
+        epoch += int(digits) / 10.0 ** len(digits)
+    return epoch
 
 
 def clean(text):
@@ -327,6 +338,27 @@ def scan_codex(path):
 # worst gap observed, and errs towards showing a session that might be gone
 # over hiding one that is running.
 HEARTBEAT = 300
+
+
+# How long a Codex turn may go quiet and still count as running. Two windows,
+# because the two branches that use them have different evidence to work with.
+#
+# Without a held lock the transcript is the only sign of life at all, so the
+# window has to stay tight and HEARTBEAT is reused: the cost of being wrong
+# there is a row that reads `-` a few minutes early.
+#
+# With one, the TUI is already proven open and the only thing left to catch is
+# a turn abandoned without writing its completion, so the window can be wide --
+# and has to be. Turns go quiet for long stretches perfectly legitimately, on a
+# build, a stalled model, or a run left going overnight: across a 4396-turn
+# corpus 3.7% of turns contain a silent stretch longer than HEARTBEAT and the
+# longest ran 23.7 hours. At 300s that branch called one working session in
+# twenty-seven idle.
+#
+# Two days, not one: a day clears the longest turn on record by an hour, which
+# is no margin at all for a bound whose whole job is to be generous. Waiting an
+# extra day to notice an abandoned turn costs nothing by comparison.
+STALE_TURN = 2 * 86400
 
 
 # 100-nanosecond ticks between the FILETIME epoch (1601) and the Unix one.
@@ -592,7 +624,6 @@ _SCAN_CACHE = {}
 
 def collect(tools):
     rows, skipped = [], 0
-    now = time.time()
     sources = []
     if "claude" in tools and CLAUDE_ROOT.is_dir():
         sources += [(p, scan_claude) for p in CLAUDE_ROOT.glob("*/*.jsonl")]
@@ -628,12 +659,25 @@ def collect(tools):
         # drift that way, so prefer it, and never trust a time in the future.
         # Claude rows keep mtime: their liveness comes from the process
         # registry, not from here.
-        row["last"] = min(row.get("ended") or st.st_mtime, now)
+        #
+        # Popped rather than kept: `ended` is scan bookkeeping, and -j dumps
+        # these rows verbatim. The cache holds its own copy, so this does not
+        # reach into it.
+        stamp = row.pop("ended", None)
+        row["last"] = stamp if stamp is not None else st.st_mtime
         rows.append(row)
 
     reg = live_claude() if "claude" in tools else {}
     codex_live = live_codex() if "codex" in tools else set()
+    # After the scan, not before it: a cold sweep runs several seconds, and a
+    # `now` taken ahead of it shortens every window below by that much and
+    # clamps live rows to a moment already past.
+    now = time.time()
     for row in rows:
+        # Never a time in the future, so a stamp written against a skewed clock
+        # cannot pin a row at "just now" for good.
+        row["last"] = min(row["last"], now)
+
         if row["tool"] == "claude":
             row["live"] = reg.get(row["id"])
             continue
@@ -643,20 +687,22 @@ def collect(tools):
         # writing one -- interrupted, superseded, or killed mid-turn. That
         # shape then stays on disk for good, so on its own `active` reports a
         # session that stopped working in April as busy in August. A turn that
-        # is genuinely running writes as it goes, so a transcript nobody has
-        # touched in HEARTBEAT seconds is over, however it ended.
-        running = row.get("active") and now - row["last"] <= HEARTBEAT
+        # is genuinely running writes as it goes, so how long it has been quiet
+        # is what decides whether it is still going.
+        quiet = now - row["last"]
 
         if row["id"] in codex_live:
             # The lock proves the TUI is open; the transcript says whether it
             # is working. An open session that is not is idle, not busy.
-            row["live"] = {"status": "busy" if running else "idle"}
+            working = row.get("active") and quiet <= STALE_TURN
+            row["live"] = {"status": "busy" if working else "idle"}
         else:
             # Fallback where lsof is absent -- Windows -- or the host prevents
             # process inspection: a turn in progress is the only live signal
             # left, and an open but idle TUI is indistinguishable from a closed
             # one.
-            row["live"] = {"status": "busy"} if running else None
+            working = row.get("active") and quiet <= HEARTBEAT
+            row["live"] = {"status": "busy"} if working else None
 
     # Live first, then most recent. An idle session you left open is worth more
     # than a finished one that happened to be written to a minute later.
@@ -688,6 +734,13 @@ ANSI = {
     "waiting": "\033[1;38;5;203m",  # red bold, blocked on you
     "live": "\033[38;5;80m",        # cyan, running but status unreported
 }
+
+# ANSI also holds keys that are not statuses -- dim, reset, the tool names --
+# and a status colliding with one of those would take its colour. `dim` is the
+# colour of a dead row, so that collision is the one that must not happen.
+# Derived rather than restated: a status colour added to ANSI alone would
+# otherwise keep rendering as generic `live`.
+LIVE_STATES = set(ANSI) - {"reset", "dim", "claude", "codex"}
 
 
 def live_state(row):
@@ -797,7 +850,7 @@ def build_table(rows, now, show_model, width, paint=False, exchange=False):
             # Code writes now. An unrecognised one still names a running
             # session, so it takes the generic live colour rather than
             # rendering uncoloured next to the dead rows.
-            return tint(padded, state if state in ANSI else "live")
+            return tint(padded, state if state in LIVE_STATES else "live")
         # You wrote the prompt; the reply is the part worth reading.
         if col in ("LAST", "TURNS", "BRANCH", "PROMPT"):
             return tint(padded, "dim")
